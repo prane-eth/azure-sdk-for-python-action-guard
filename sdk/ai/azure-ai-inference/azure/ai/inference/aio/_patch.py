@@ -12,7 +12,7 @@ import logging
 import sys
 
 from io import IOBase
-from typing import Any, Dict, Union, IO, List, Literal, Optional, overload, Type, TYPE_CHECKING, AsyncIterable
+from typing import Any, Dict, Union, IO, List, Literal, Optional, overload, Type, TYPE_CHECKING, AsyncIterable, Callable
 
 from azure.core.pipeline import PipelineResponse
 from azure.core.credentials import AzureKeyCredential
@@ -37,6 +37,7 @@ from .._operations._operations import (
     build_image_embeddings_embed_request,
 )
 from .._patch import _get_internal_response_format
+from .._action_guard import GuardDecision, ToolCall
 
 if TYPE_CHECKING:
     # pylint: disable=unused-import,ungrouped-imports
@@ -295,6 +296,7 @@ class ChatCompletionsClient(ChatCompletionsClientGenerated):  # pylint: disable=
         seed: Optional[int] = None,
         model: Optional[str] = None,
         model_extras: Optional[Dict[str, Any]] = None,
+        action_guard: Optional[Callable[[ToolCall], GuardDecision]] = None,
         **kwargs: Any,
     ) -> _models.ChatCompletions: ...
 
@@ -318,6 +320,7 @@ class ChatCompletionsClient(ChatCompletionsClientGenerated):  # pylint: disable=
         seed: Optional[int] = None,
         model: Optional[str] = None,
         model_extras: Optional[Dict[str, Any]] = None,
+        action_guard: Optional[Callable[[ToolCall], GuardDecision]] = None,
         **kwargs: Any,
     ) -> AsyncIterable[_models.StreamingChatCompletionsUpdate]: ...
 
@@ -341,6 +344,7 @@ class ChatCompletionsClient(ChatCompletionsClientGenerated):  # pylint: disable=
         seed: Optional[int] = None,
         model: Optional[str] = None,
         model_extras: Optional[Dict[str, Any]] = None,
+        action_guard: Optional[Callable[[ToolCall], GuardDecision]] = None,
         **kwargs: Any,
     ) -> Union[AsyncIterable[_models.StreamingChatCompletionsUpdate], _models.ChatCompletions]:
         # pylint: disable=line-too-long
@@ -503,6 +507,7 @@ class ChatCompletionsClient(ChatCompletionsClientGenerated):  # pylint: disable=
         seed: Optional[int] = None,
         model: Optional[str] = None,
         model_extras: Optional[Dict[str, Any]] = None,
+        action_guard: Optional[Callable[[ToolCall], GuardDecision]] = None,
         **kwargs: Any,
     ) -> Union[AsyncIterable[_models.StreamingChatCompletionsUpdate], _models.ChatCompletions]:
         # pylint: disable=line-too-long
@@ -676,9 +681,42 @@ class ChatCompletionsClient(ChatCompletionsClientGenerated):  # pylint: disable=
             raise HttpResponseError(response=response)
 
         if _stream:
-            return _models.AsyncStreamingChatCompletions(response)
+            streaming = _models.AsyncStreamingChatCompletions(response)
+            if action_guard is None:
+                return streaming
 
-        return _deserialize(_models._patch.ChatCompletions, response.json())  # pylint: disable=protected-access
+            async def _astream_generator():
+                async for update in streaming:
+                    try:
+                        choices = getattr(update, "choices", []) or []
+                        for c in choices:
+                            delta = getattr(c, "delta", None)
+                            if delta and getattr(delta, "tool_calls", None):
+                                for tool_call in delta.tool_calls:
+                                    decision = action_guard(tool_call)
+                                    if decision == GuardDecision.BLOCK:
+                                        await streaming.aclose()
+                                        raise ValueError("Tool call blocked by action_guard")
+                    except Exception:
+                        try:
+                            await streaming.aclose()
+                        except Exception:
+                            pass
+                        raise
+                    yield update
+
+            return _astream_generator()
+
+        result = _deserialize(_models._patch.ChatCompletions, response.json())  # pylint: disable=protected-access
+        if action_guard is not None:
+            for choice in getattr(result, "choices", []) or []:
+                message = getattr(choice, "message", None)
+                if message and getattr(message, "tool_calls", None):
+                    for tool_call in message.tool_calls:
+                        if action_guard(tool_call) == GuardDecision.BLOCK:
+                            raise ValueError("Tool call blocked by action_guard")
+
+        return result
 
     @distributed_trace_async
     async def get_model_info(self, **kwargs: Any) -> _models.ModelInfo:

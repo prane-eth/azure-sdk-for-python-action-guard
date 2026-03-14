@@ -286,6 +286,40 @@ includes sending image data read from a local file.
 * [sample_chat_completions_with_audio_data.py](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/ai/azure-ai-inference/samples/sample_chat_completions_with_audio_data.py) for usage of `UserMessage` that includes sending audio data read from a local file.
 * [sample_chat_completions_with_structured_output.py](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/ai/azure-ai-inference/samples/sample_chat_completions_with_structured_output.py) and [sample_chat_completions_with_structured_output_pydantic.py](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/ai/azure-ai-inference/samples/sample_chat_completions_with_structured_output_pydantic.py) for configuring the service to respond with a JSON-formatted string, adhering to your schema.
 
+### Action Guard for tool calls
+
+`action_guard` provides a centralized validation hook that runs whenever the client detects a tool call
+requested by the model. The guard is a user-provided callable that receives the tool call object and
+returns a `GuardDecision` (`ALLOW` or `BLOCK`). When a tool call is blocked, the client will raise an
+exception instead of executing/propagating the tool call.
+
+- Pass `action_guard` to `ChatCompletionsClient.complete` (sync and async variants).
+- Signature (conceptual): `action_guard: Optional[Callable[[ToolCall], GuardDecision]]`
+
+Behavior:
+
+- Non-streaming responses: the client inspects `response.choices[].message.tool_calls` and calls the guard
+    for each tool call. If any guard returns `GuardDecision.BLOCK`, the client raises `ValueError("Tool call blocked by action_guard")`.
+
+- Streaming responses: the client wraps the streaming iterator and evaluates `tool_calls` appearing in
+    streaming updates. If blocked, the stream is closed and `ValueError("Tool call blocked by action_guard")` is raised.
+
+Example:
+
+```python
+from azure.ai.inference import ChatCompletionsClient
+from azure.ai.inference._action_guard import GuardDecision
+
+def my_guard(tool_call):
+        # simple example: block calls to a function named "dangerous"
+        if getattr(tool_call.function, "name", "") == "dangerous":
+                return GuardDecision.BLOCK
+        return GuardDecision.ALLOW
+
+client = ChatCompletionsClient(endpoint, credential)
+response = client.complete(messages=[...], tools=[...], action_guard=my_guard)
+```
+
 Alternatively, you can provide the full request body as a Python dictionary (`dict` object) instead of using the strongly typed classes like `SystemMessage` and `UserMessage`:
 
 <!-- SNIPPET:sample_chat_completions_from_input_dict.chat_completions_full_request_as_dict -->
